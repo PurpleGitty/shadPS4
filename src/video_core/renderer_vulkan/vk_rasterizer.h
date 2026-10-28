@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -20,6 +22,10 @@ class MemoryManager;
 }
 
 namespace Vulkan {
+
+extern std::atomic<bool> g_lbp3TraceDraws;
+extern u32 g_lbp3TraceIndex;
+extern void (*g_lbp3AfterDraw)(u32 index);
 
 class GraphicsPipeline;
 class Runtime;
@@ -47,6 +53,7 @@ public:
     }
 
     void Draw(bool is_indexed, u32 index_offset = 0);
+    void TraceDraw(const GraphicsPipeline* pipeline);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
 

@@ -51,13 +51,95 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
+// Recent label writes from command streams, printed when a WAIT_REG_MEM gets stuck.
+struct LabelWrite {
+    const char* source;
+    u64 address;
+    u64 data;
+};
+static std::array<LabelWrite, 64> recent_label_writes{};
+static std::atomic<u32> recent_label_write_count{};
+
+static void NoteLabelWrite(const char* source, u64 address, u64 data) {
+    recent_label_writes[recent_label_write_count++ % recent_label_writes.size()] = {source,
+                                                                                    address, data};
+}
+
+// Whether a command stream wrote the 8 bytes at address since write number `since`.
+static bool LabelWrittenSince(u64 address, u32 since) {
+    const u32 now = recent_label_write_count;
+    if (now - since > recent_label_writes.size()) return true;  // history overrun: assume so
+    for (u32 i = since; i != now; ++i) {
+        const LabelWrite& w = recent_label_writes[i % recent_label_writes.size()];
+        if (w.address >= address - 7 && w.address <= address + 7) return true;
+    }
+    return false;
+}
+
+Liverpool::BlockedWait Liverpool::BeginBlockedWait(u64 addr) {
+    std::scoped_lock lk{submit_mutex};
+    last_blocked_addr = addr;
+    ++queues_blocked_on_wait;
+    submit_cv.notify_all();
+    return {addr, recent_label_write_count.load(), grace_releases.load()};
+}
+
+void Liverpool::EndBlockedWait(const BlockedWait& wait) {
+    std::scoped_lock lk{submit_mutex};
+    --queues_blocked_on_wait;
+    if (!wait.addr) return;
+    const auto known = std::find(guest_written_waits.begin(), guest_written_waits.end(), wait.addr);
+    if (LabelWrittenSince(wait.addr, wait.label_writes)) {
+        if (known != guest_written_waits.end()) guest_written_waits.erase(known);
+    } else if (grace_releases != wait.grace_releases && known == guest_written_waits.end() &&
+               guest_written_waits.size() < 256) {
+        guest_written_waits.push_back(wait.addr);
+        ++learned_waits;
+    }
+}
+
+// DMA_DATA with an immediate value fills the GPU copy of memory; also write guest memory,
+// since WAIT_REG_MEM and the PM4 parser read guest memory on the CPU (LBP3 sets
+// cross-queue labels this way: a compute wait on a DMA-written label never ended).
+static void MirrorDmaFill(const char* source, VAddr dst, u32 num_bytes, u32 value) {
+    NoteLabelWrite(source, dst, value);
+    auto* memory = Core::Memory::Instance();
+    std::array<u32, 64> chunk;
+    chunk.fill(value);
+    for (u32 done = 0; done < num_bytes;) {
+        const u32 n = std::min<u32>(num_bytes - done, sizeof(chunk));
+        memory->TryWriteBacking(reinterpret_cast<void*>(dst + done), chunk.data(), n);
+        done += n;
+    }
+}
+
+static void ReportStuckWait(const char* queue, const PM4CmdWaitRegMem* wait, u32 value) {
+    const bool memory = wait->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+    const u64 address = memory ? reinterpret_cast<uintptr_t>(wait->Address()) : wait->Reg();
+    LOG_WARNING(Render_Vulkan,
+                "WaitRegMem stuck over 1 s on {}: {} {:#x} value={:#x} func={} ref={:#x} mask={:#x}",
+                queue, memory ? "memory" : "register", address, value,
+                static_cast<u32>(wait->function.Value()), wait->ref, wait->mask);
+    const u32 total = recent_label_write_count;
+    for (u32 i = total > recent_label_writes.size() ? total - recent_label_writes.size() : 0;
+         i < total; ++i) {
+        const auto& w = recent_label_writes[i % recent_label_writes.size()];
+        if (w.address + 0x1000 > address && w.address < address + 0x1000) {
+            LOG_WARNING(Render_Vulkan, "  nearby label write #{}: {} {:#x} = {:#x}", i, w.source,
+                        w.address, w.data);
+        }
+    }
+    LOG_WARNING(Render_Vulkan, "  {} label writes so far", total);
+}
+
 static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
     if (offset > span.size()) {
         LOG_ERROR(
             Lib_GnmDriver,
             ": packet length exceeds remaining submission size. Packet dword count={}, remaining "
-            "submission dwords={}",
-            offset, span.size());
+            "submission dwords={}, at {:#x} (header {:08x})",
+            offset, span.size(), reinterpret_cast<uintptr_t>(span.data()),
+            span.empty() ? 0u : span[0]);
         // Return empty subspan so check for next packet bails out
         return {};
     }
@@ -166,6 +248,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        const u32 packet_dwords = header->type3.NumWords() + 1;  // before the packet runs
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
         case PM4ItOpcode::Nop: {
@@ -213,7 +296,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
                             static_cast<u32>(opcode), count);
         }
-        ccb = NextPacket(ccb, header->type3.NumWords() + 1);
+        ccb = NextPacket(ccb, packet_dwords);
     }
 
     FIBER_EXIT;
@@ -235,20 +318,87 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    const PM4Header* previous_header = nullptr;  // for diagnosing misparses
+    const PM4Header* current_header = nullptr;
+    std::array<const PM4Header*, 8> recent_headers{};
+    u32 recent_count = 0;
+    bool dumped_context = false;
     while (!dcb.empty()) {
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
+        previous_header = current_header;
+        current_header = header;
+        recent_headers[recent_count++ % recent_headers.size()] = header;
+        if (type == 0 && header->type0.base.Value() != 0 && !dumped_context) {
+            // The first real misparse in this buffer: show how the parser got here.
+            dumped_context = true;
+            const auto at = reinterpret_cast<uintptr_t>(header);
+            std::string headers;
+            for (u32 i = recent_count > recent_headers.size() ? recent_count - recent_headers.size()
+                                                              : 0;
+                 i < recent_count; ++i) {
+                const auto* h = recent_headers[i % recent_headers.size()];
+                headers += fmt::format(" [{}: {:08x}]",
+                                       (reinterpret_cast<uintptr_t>(h) - base_addr) / 4, h->raw);
+            }
+            const size_t offset = (at - base_addr) / 4;
+            const auto* words = reinterpret_cast<const u32*>(at);
+            std::string before;
+            for (size_t i = std::min<size_t>(offset, 32); i > 0; --i) {
+                before += fmt::format(" {:08x}", words[-static_cast<ptrdiff_t>(i)]);
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "PM4 misparse context at dword {} of a buffer at {:#x}: last headers "
+                        "(dword: header):{}; 32 words before:{}",
+                        offset, base_addr, headers, before);
+        }
 
         switch (type) {
-        default:
-            UNREACHABLE_MSG("Wrong PM4 type {}", type);
-            break;
-        case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
-            break;
+        case 0: {
+            // Type-0: write NumWords consecutive registers from base. Guests use zero dwords
+            // (register 0, one word) as filler, which does nothing on hardware.
+            const u32 base = header->type0.base.Value();
+            static std::atomic<int> reported{};
+            if (base != 0 || reported++ < 6) {
+                const auto at = reinterpret_cast<uintptr_t>(dcb.data());
+                const size_t offset = (at - base_addr) / 4;
+                std::string previous;
+                if (previous_header) {
+                    const auto* p = reinterpret_cast<const u32*>(previous_header);
+                    const size_t n = std::min<size_t>((at - reinterpret_cast<uintptr_t>(p)) / 4, 12);
+                    for (size_t i = 0; i < n; ++i) {
+                        previous += fmt::format(" {:08x}", p[i]);
+                    }
+                }
+                std::string next;
+                for (size_t i = 0; i < std::min<size_t>(dcb.size(), 6); ++i) {
+                    next += fmt::format(" {:08x}", dcb[i]);
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "PM4 type 0 write of {} registers at {:#x}, dword {} of a buffer at "
+                            "{:#x}; previous packet:{}; here:{}",
+                            header->type0.NumWords(), base, offset, base_addr, previous, next);
+            }
+            dcb = NextPacket(dcb, header->type0.NumWords() + 1);
+            continue;
+        }
+        default: {
+            // Garbage where a packet should be: the guest changed the buffer under us or
+            // submitted it before it was complete. Drop the rest instead of aborting.
+            const auto at = reinterpret_cast<uintptr_t>(dcb.data());
+            std::string words;
+            for (size_t i = 0; i < std::min<size_t>(dcb.size(), 8); ++i) {
+                words += fmt::format(" {:08x}", dcb[i]);
+            }
+            LOG_ERROR(Render_Vulkan,
+                      "Bad PM4 packet (type {}) at {:#x}, dword {} of a buffer at {:#x}, {} dwords "
+                      "left:{}; skipping the rest",
+                      type, at, (at - base_addr) / 4, base_addr, dcb.size(), words);
+            dcb = {};
+            continue;
+        }
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
@@ -663,6 +813,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     rasterizer->OnFence();
                 }
                 event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
+                    NoteLabelWrite("gfx EOS", reinterpret_cast<u64>(address), data);
                     auto* memory = Core::Memory::Instance();
                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                 });
@@ -683,6 +834,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 event_eop->SignalFence(
                     [](void* address, u64 data, u32 num_bytes) {
+                        NoteLabelWrite("gfx EOP", reinterpret_cast<u64>(address), data);
                         auto* memory = Core::Memory::Instance();
                         ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                     },
@@ -708,15 +860,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
                     rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
                                            dma_data->data, false);
+                    MirrorDmaFill("gfx DMA_DATA fill", dma_data->DstAddress<VAddr>(),
+                                  dma_data->NumBytes(), dma_data->data);
                 } else if (dma_data->src_sel == DmaDataSrc::Gds &&
                            (dma_data->dst_sel == DmaDataDst::Memory ||
                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                    NoteLabelWrite("gfx DMA_DATA from GDS", dma_data->DstAddress<VAddr>(),
+                                   dma_data->src_addr_lo);
                     rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
                                            dma_data->NumBytes(), false, true);
                 } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                             dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                            (dma_data->dst_sel == DmaDataDst::Memory ||
                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                    NoteLabelWrite("gfx DMA_DATA copy (value is the source address)",
+                                   dma_data->DstAddress<VAddr>(), dma_data->SrcAddress<VAddr>());
                     rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
                                            dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
                                            false, false);
@@ -735,6 +893,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (rasterizer) {
                         rasterizer->OnFence();
                     }
+                    NoteLabelWrite("gfx WRITE_DATA", reinterpret_cast<u64>(address),
+                                   write_data->data[0]);
                     std::memcpy(address, write_data->data, data_size);
                 } else {
                     UNREACHABLE();
@@ -754,10 +914,24 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::MemSemaphore: {
                 const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
                 if (mem_semaphore->IsSignaling()) {
+                    NoteLabelWrite("gfx MEM_SEMAPHORE signal", mem_semaphore->Address<u64>(), 1);
                     mem_semaphore->Signal();
                 } else {
-                    while (!mem_semaphore->Signaled()) {
-                        YIELD_GFX();
+                    if (!mem_semaphore->Signaled()) {
+                        const auto blocked = BeginBlockedWait(mem_semaphore->Address<u64>());
+                        const auto wait_start = std::chrono::steady_clock::now();
+                        bool reported = false;
+                        while (!mem_semaphore->Signaled()) {
+                            if (!reported && std::chrono::steady_clock::now() - wait_start >
+                                                 std::chrono::seconds(1)) {
+                                reported = true;
+                                LOG_WARNING(Render_Vulkan,
+                                            "MEM_SEMAPHORE wait stuck over 1 s on gfx: {:#x}",
+                                            mem_semaphore->Address<u64>());
+                            }
+                            YIELD_GFX();
+                        }
+                        EndBlockedWait(blocked);
                     }
                     mem_semaphore->Decrement();
                 }
@@ -790,8 +964,26 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
-                    YIELD_GFX();
+                if (!wait_reg_mem->Test(regs.reg_array)) {
+                    // The guest may satisfy this wait only after its submit call returns.
+                    const auto blocked = BeginBlockedWait(wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
+                                         ? wait_reg_mem->Address<u64>()
+                                         : 0);
+                    const auto wait_start = std::chrono::steady_clock::now();
+                    bool reported = false;
+                    while (!wait_reg_mem->Test(regs.reg_array)) {
+                        if (!reported && std::chrono::steady_clock::now() - wait_start >
+                                             std::chrono::seconds(1)) {
+                            reported = true;
+                            const bool memory =
+                                wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+                            ReportStuckWait("gfx", wait_reg_mem,
+                                            memory ? *wait_reg_mem->Address()
+                                                   : regs.reg_array[wait_reg_mem->Reg()]);
+                        }
+                        YIELD_GFX();
+                    }
+                    EndBlockedWait(blocked);
                 }
                 break;
             }
@@ -842,17 +1034,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto skip = *cond_exec->Address() == false;
                 if (skip) {
-                    dcb = NextPacket(dcb,
-                                     header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
+                    dcb = NextPacket(dcb, count + 1 + cond_exec->exec_count.Value());
                     continue;
                 }
                 break;
             }
             default:
-                UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                                static_cast<u32>(opcode), count);
+                LOG_ERROR(Render_Vulkan,
+                          "Unknown PM4 type 3 opcode {:#x} with count {} at {:#x}, dword {} of a "
+                          "buffer at {:#x}; skipping the rest",
+                          static_cast<u32>(opcode), count, reinterpret_cast<uintptr_t>(header),
+                          (reinterpret_cast<uintptr_t>(header) - base_addr) / 4, base_addr);
+                dcb = {};
+                continue;
             }
-            dcb = NextPacket(dcb, header->type3.NumWords() + 1);
+            // The size read before the packet ran: executing it can let the guest reuse this
+            // memory (an EOP interrupt wakes its callback, a WAIT_REG_MEM lets it run on).
+            dcb = NextPacket(dcb, count + 1);
             break;
         }
     }
@@ -917,6 +1115,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             continue;
         }
 
+        if (header->type == 0) {
+            // Type-0 register writes; zero dwords (register 0) are filler. The count field
+            // sits where type-3's does, so next_dw_off already covers the packet.
+            acb = NextPacket(acb, next_dw_off);
+            if constexpr (!is_indirect) {
+                *queue.read_addr += next_dw_off;
+                *queue.read_addr %= queue.ring_size_dw;
+            }
+            continue;
+        }
+
         if (header->type != 3) {
             // No other types of packets were spotted so far
             UNREACHABLE_MSG("Invalid PM4 type {}", header->type.Value());
@@ -962,9 +1171,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
                 rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
                                        dma_data->data, false);
+                MirrorDmaFill("compute DMA_DATA fill", dma_data->DstAddress<VAddr>(),
+                              dma_data->NumBytes(), dma_data->data);
             } else if (dma_data->src_sel == DmaDataSrc::Gds &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                NoteLabelWrite("compute DMA_DATA from GDS", dma_data->DstAddress<VAddr>(),
+                               dma_data->src_addr_lo);
                 rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
                                        dma_data->NumBytes(), false, true);
             } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
@@ -974,6 +1187,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 const u32 num_bytes = dma_data->NumBytes();
                 const VAddr src_addr = dma_data->SrcAddress<VAddr>();
                 const VAddr dst_addr = dma_data->DstAddress<VAddr>();
+                NoteLabelWrite("compute DMA_DATA copy (value is the source address)", dst_addr,
+                               src_addr);
                 const PM4Header* header =
                     reinterpret_cast<const PM4Header*>(dst_addr - sizeof(PM4Header));
                 if (dst_addr >= base_addr && dst_addr < base_addr + acb_size &&
@@ -1077,6 +1292,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
+                NoteLabelWrite("compute WRITE_DATA", reinterpret_cast<u64>(write_data->Address<void*>()),
+                               write_data->data[0]);
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             } else {
                 UNREACHABLE();
@@ -1086,10 +1303,24 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
             if (mem_semaphore->IsSignaling()) {
+                NoteLabelWrite("compute MEM_SEMAPHORE signal", mem_semaphore->Address<u64>(), 1);
                 mem_semaphore->Signal();
             } else {
-                while (!mem_semaphore->Signaled()) {
-                    YIELD_ASC(vqid);
+                if (!mem_semaphore->Signaled()) {
+                    const auto blocked = BeginBlockedWait(mem_semaphore->Address<u64>());
+                    const auto wait_start = std::chrono::steady_clock::now();
+                    bool reported = false;
+                    while (!mem_semaphore->Signaled()) {
+                        if (!reported &&
+                            std::chrono::steady_clock::now() - wait_start > std::chrono::seconds(1)) {
+                            reported = true;
+                            LOG_WARNING(Render_Vulkan,
+                                        "MEM_SEMAPHORE wait stuck over 1 s on compute: {:#x}",
+                                        mem_semaphore->Address<u64>());
+                        }
+                        YIELD_ASC(vqid);
+                    }
+                    EndBlockedWait(blocked);
                 }
                 mem_semaphore->Decrement();
             }
@@ -1098,8 +1329,25 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            while (!wait_reg_mem->Test(regs.reg_array)) {
-                YIELD_ASC(vqid);
+            if (!wait_reg_mem->Test(regs.reg_array)) {
+                const auto blocked = BeginBlockedWait(wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
+                                     ? wait_reg_mem->Address<u64>()
+                                     : 0);
+                const auto wait_start = std::chrono::steady_clock::now();
+                bool reported = false;
+                while (!wait_reg_mem->Test(regs.reg_array)) {
+                    if (!reported &&
+                        std::chrono::steady_clock::now() - wait_start > std::chrono::seconds(1)) {
+                        reported = true;
+                        const bool memory =
+                            wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+                        ReportStuckWait("compute", wait_reg_mem,
+                                        memory ? *wait_reg_mem->Address()
+                                               : regs.reg_array[wait_reg_mem->Reg()]);
+                    }
+                    YIELD_ASC(vqid);
+                }
+                EndBlockedWait(blocked);
             }
             break;
         }
@@ -1108,6 +1356,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->OnFence();
             }
+            NoteLabelWrite("compute RELEASE_MEM", release_mem->Address<u64>(),
+                           release_mem->DataQWord());
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));

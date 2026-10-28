@@ -181,6 +181,55 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+// LBP3 debug: while set, every draw is logged (targets, sampled images, shaders).
+std::atomic<bool> g_lbp3TraceDraws{false};
+// Index of the current traced draw/dispatch (1-based, same numbering as the log)
+// and an optional callback run right after each traced draw executes.
+u32 g_lbp3TraceIndex = 0;
+void (*g_lbp3AfterDraw)(u32 index) = nullptr;
+
+void Rasterizer::TraceDraw(const GraphicsPipeline* pipeline) {
+    const auto& regs = liverpool->regs;
+    ++g_lbp3TraceIndex;
+    std::string line = "[draw] #" + std::to_string(g_lbp3TraceIndex);
+    char buf[160];
+    const auto stages = pipeline->GetStages();
+    const auto hash = [&](Shader::SwStage st) -> unsigned long long {
+        const auto* info = stages[u32(st)];
+        return info ? info->pgm_hash : 0;
+    };
+    std::snprintf(buf, sizeof(buf), " n=%u vs=%016llx ps=%016llx", regs.num_indices,
+                  hash(Shader::SwStage::Vertex), hash(Shader::SwStage::Fragment));
+    line += buf;
+    for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+        const auto& cb = regs.color_buffers[i];
+        if (!cb) {
+            continue;
+        }
+        u32 blend;
+        std::memcpy(&blend, &regs.blend_control[i], 4);
+        std::snprintf(buf, sizeof(buf), " rt%u=%llx(blend %08x)", i, (unsigned long long)cb.Address(),
+                      blend);
+        line += buf;
+    }
+    const auto& db = regs.depth_buffer;
+    if (db.DepthValid() || db.DepthWriteValid()) {
+        std::snprintf(buf, sizeof(buf), " z=r%llx/w%llx(test %u write %u fmt %u)",
+                      (unsigned long long)db.DepthAddress(),
+                      (unsigned long long)db.DepthWriteAddress(), regs.depth_control.depth_enable,
+                      regs.depth_control.depth_write_enable, static_cast<u32>(db.z_info.format));
+        line += buf;
+    }
+    for (u32 i = 0; i < bound_images.size(); ++i) {
+        const auto& image = texture_cache.GetImage(bound_images[i]);
+        std::snprintf(buf, sizeof(buf), " tex=%llx(%ux%u %s)",
+                      (unsigned long long)image.info.guest_address, image.info.size.width,
+                      image.info.size.height, vk::to_string(image.info.pixel_format).c_str());
+        line += buf;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -199,6 +248,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
+    }
+    if (g_lbp3TraceDraws) {
+        TraceDraw(pipeline);
     }
     const auto state = BeginRendering(pipeline);
 
@@ -230,6 +282,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     instance_offset);
     }
     DebugState.IncDrawCall();
+    if (g_lbp3TraceDraws && g_lbp3AfterDraw) {
+        g_lbp3AfterDraw(g_lbp3TraceIndex);
+    }
 
     ResetBindings(false);
 }
@@ -333,6 +388,40 @@ void Rasterizer::DispatchDirect() {
 
     if (!BindResources(pipeline)) {
         return;
+    }
+    if (g_lbp3TraceDraws) {
+        ++g_lbp3TraceIndex;
+        std::string line = "[dispatch] #" + std::to_string(g_lbp3TraceIndex);
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), " %ux%ux%u cs=%016llx", cs_program.dim_x, cs_program.dim_y,
+                      cs_program.dim_z, (unsigned long long)cs.pgm_hash);
+        line += buf;
+        for (const auto& desc : cs.buffers) {
+            if (desc.IsSpecial()) {
+                continue;
+            }
+            const auto sharp = desc.GetSharp(cs);
+            std::snprintf(buf, sizeof(buf), " buf%s=%llx+%x", desc.is_written ? "W" : "R",
+                          (unsigned long long)sharp.base_address, sharp.GetSize());
+            line += buf;
+            if (!desc.is_written && sharp.GetSize() <= 16) {
+                const auto* words = reinterpret_cast<const u32*>(sharp.base_address);
+                line += "[";
+                for (u32 w = 0; w < sharp.GetSize() / 4; ++w) {
+                    std::snprintf(buf, sizeof(buf), "%s%08x", w ? " " : "", words[w]);
+                    line += buf;
+                }
+                line += "]";
+            }
+        }
+        for (u32 i = 0; i < bound_images.size(); ++i) {
+            const auto& image = texture_cache.GetImage(bound_images[i]);
+            std::snprintf(buf, sizeof(buf), " img=%llx(%ux%u %s)",
+                          (unsigned long long)image.info.guest_address, image.info.size.width,
+                          image.info.size.height, vk::to_string(image.info.pixel_format).c_str());
+            line += buf;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
     }
 
     if (needs_barrier) {
@@ -870,6 +959,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             continue;
         }
 
+        if (g_lbp3TraceDraws) {
+            std::fprintf(stderr, "[draw]   image %llx dfmt=%u nfmt=%u dst_sel=%u%u%u%u depth=%d\n",
+                         (unsigned long long)tsharp.Address(), static_cast<u32>(data_fmt),
+                         static_cast<u32>(num_fmt), static_cast<u32>(tsharp.dst_sel_x),
+                         static_cast<u32>(tsharp.dst_sel_y), static_cast<u32>(tsharp.dst_sel_z),
+                         static_cast<u32>(tsharp.dst_sel_w), image_desc.is_depth ? 1 : 0);
+        }
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const u32 num_bindings = image_desc.NumBindings(stage);
 

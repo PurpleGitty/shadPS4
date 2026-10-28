@@ -225,6 +225,13 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
 
+    // A 3D image has one array layer: slice views of it (render targets into a
+    // volume, LBP3 fills lighting volumes slice by slice) transition the whole image.
+    if (info.props.is_volume && subres_range) {
+        subres_range->base.layer = 0;
+        subres_range->extent.layers = info.resources.layers;
+    }
+
     const bool needs_partial_transition =
         subres_range &&
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);

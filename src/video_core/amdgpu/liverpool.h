@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -82,6 +84,40 @@ public:
     void WaitGpuIdle() noexcept {
         std::unique_lock lk{submit_mutex};
         submit_cv.wait(lk, [this] { return num_submits == 0; });
+    }
+
+    // Like WaitGpuIdle, but also returns while the graphics queue waits on memory the guest
+    // may only write after its submit returns (a synchronous submit would deadlock there).
+    // A short wait (e.g. on async compute) is waited out, so the guest's frames stay in step
+    // with the GPU; only a queue blocked for a grace period releases the guest early. A wait
+    // address that once needed that release (the guest writes it after the submit) releases
+    // the guest at once from then on, so such frames don't pay the grace period every time.
+    void WaitGpuIdleOrBlocked() noexcept {
+        using namespace std::chrono_literals;
+        std::unique_lock lk{submit_mutex};
+        std::chrono::steady_clock::time_point blocked_since{};
+        while (num_submits != 0) {
+            if (queues_blocked_on_wait > 0) {
+                const auto now = std::chrono::steady_clock::now();
+                const u64 addr = last_blocked_addr;
+                const bool known = addr && std::find(guest_written_waits.begin(), guest_written_waits.end(),
+                                                     addr) != guest_written_waits.end();
+                if (known) {
+                    ++early_releases;
+                    return;
+                }
+                if (blocked_since == std::chrono::steady_clock::time_point{}) {
+                    blocked_since = now;
+                } else if (now - blocked_since >= 20ms) {
+                    ++grace_releases;  // EndBlockedWait learns the address if the guest wrote it
+                    ++early_releases;
+                    return;
+                }
+            } else {
+                blocked_since = {};
+            }
+            submit_cv.wait_for(lk, 1ms);
+        }
     }
 
     bool IsGpuIdle() const {
@@ -235,6 +271,30 @@ private:
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
+    std::atomic<u32> queues_blocked_on_wait{};
+    std::atomic<u64> last_blocked_addr{};      // memory address of the latest blocked wait (0: register)
+    std::vector<u64> guest_written_waits;      // wait addresses that needed an early release
+
+    std::atomic<u32> grace_releases{};          // guest releases after the grace period
+
+    // A queue starts waiting on memory (addr) or a register (0) that isn't ready yet.
+    // Returns the state EndBlockedWait needs.
+    struct BlockedWait {
+        u64 addr;
+        u32 label_writes;    // label write count at the start
+        u32 grace_releases;  // grace_releases at the start
+    };
+    BlockedWait BeginBlockedWait(u64 addr);
+    // The wait ended. If the guest had to be released to end it and no command stream
+    // wrote the address meanwhile, the guest's CPU wrote it: remember the address. If a
+    // command stream wrote it, forget it (a GPU-side label must be waited out).
+    void EndBlockedWait(const BlockedWait& wait);
+
+public:
+    std::atomic<u32> early_releases{};  // guest released from a submit while the GPU was blocked
+    std::atomic<u32> learned_waits{};   // wait addresses added to guest_written_waits
+
+private:
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};

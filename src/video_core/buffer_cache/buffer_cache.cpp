@@ -351,6 +351,16 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     if (is_texel_buffer && !is_written) {
         return SynchronizeMemoryFromImage(arena, device_addr, size);
     }
+    // LBP3: a shader that writes a buffer aliasing a GPU-rendered image may also
+    // read it first (LBP3's masked fill, dst = (dst & ~mask) | (value & mask),
+    // clears only alpha of its scene buffer). Start such buffers from the image's
+    // current contents, or the read sees stale memory and the write wipes the image.
+    if (is_written) {
+        const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
+        if (image_id && texture_cache.GetImage(image_id).info.guest_address == device_addr) {
+            return SynchronizeMemoryFromImage(arena, device_addr, size);
+        }
+    }
     return false;
 }
 

@@ -26,6 +26,9 @@ static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
 
+std::atomic<u32> g_lbp3ImageCreates{};
+std::atomic<u32> g_lbp3ImageExpands{};
+
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                            BufferCache& buffer_cache_, PageManager& tracker_)
@@ -170,9 +173,12 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
-        // Only consider images that match base address.
+        // Consider images that match base address or lie entirely inside the written range.
         // TODO: Maybe also consider subresources
-        if (image.info.guest_address != address) {
+        const bool contained = image.info.guest_address >= address &&
+                               image.info.guest_address + image.info.guest_size <=
+                                   address + max_size;
+        if (image.info.guest_address != address && !contained) {
             return;
         }
         // Ensure image is reuploaded when accessed again.
@@ -298,6 +304,15 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         if (image_info.guest_size == cache_image.info.guest_size &&
             (image_info.type == AmdGpu::ImageType::Color3D ||
              cache_image.info.type == AmdGpu::ImageType::Color3D)) {
+            const bool slices_of_volume =
+                binding == BindingType::RenderTarget && cache_image.info.props.is_volume &&
+                !image_info.props.is_volume &&
+                image_info.size.width == cache_image.info.size.width &&
+                image_info.size.height == cache_image.info.size.height &&
+                image_info.resources.layers <= cache_image.info.size.depth;
+            if (slices_of_volume) {
+                return {cache_image_id, -1, -1};
+            }
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
@@ -495,7 +510,20 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     return {merged_image_id, -1, -1};
 }
 
+namespace {
+// LBP3 debug: one-line description of an image for overlap diagnostics.
+std::string DescribeInfo(const ImageInfo& i) {
+    return fmt::format("{:#x} {}x{}x{} {} layers={} mips={} tile={} bits={} size={:#x} type={}", i.guest_address,
+                       i.size.width, i.size.height, i.size.depth, vk::to_string(i.pixel_format),
+                       i.resources.layers, i.resources.levels, static_cast<u32>(i.tile_mode), i.num_bits,
+                       i.guest_size, static_cast<u32>(i.type));
+}
+} // namespace
+
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
+    LOG_WARNING(Render_Vulkan, "ExpandImage: {} -> {}", DescribeInfo(slot_images[image_id].info),
+                DescribeInfo(info));
+    ++g_lbp3ImageExpands;
     const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
 
@@ -570,15 +598,27 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
-        } else if (image_resolved.info.resources < info.resources) {
+        } else if (image_resolved.info.resources < info.resources &&
+                   !(image_resolved.info.props.is_volume && !info.props.is_volume &&
+                     image_resolved.info.size.width == info.size.width &&
+                     image_resolved.info.size.height == info.size.height &&
+                     info.resources.levels <= image_resolved.info.resources.levels &&
+                     info.resources.layers <= image_resolved.info.size.depth)) {
+            // (LBP3: a render target that is a slice of a cached 3D image - the game
+            // fills 256x128x64 lighting volumes one slice at a time - asks for
+            // "slice + 1" layers. The volume's depth provides those; it is created
+            // 2D-array compatible, so slice views of it can be rendered to. Freeing it
+            // here rebuilt the volume layer by layer every frame and lost its contents.)
             // The image was clearly picked up wrong.
+            LOG_WARNING(Render_Vulkan, "Image overlap resolve failed: have {}, want {}",
+                        DescribeInfo(image_resolved.info), DescribeInfo(info));
             FreeImage(image_id);
             image_id = {};
-            LOG_WARNING(Render_Vulkan, "Image overlap resolve failed");
         }
     }
     // Create and register a new image
     if (!image_id) {
+        ++g_lbp3ImageCreates;
         image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }
